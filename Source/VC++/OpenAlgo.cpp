@@ -21,7 +21,7 @@
 
 #define PLUGIN_TYPE     2
 #define PLUGIN_NAME     "OpenAlgo"
-#define PLUGIN_VERSION  "0.23"
+#define PLUGIN_VERSION  "0.24"
 
 // plugin-local SET_OPTCONTRACT command id (brokerCommand): homegrown
 // extension, not in Zorro's trading.h. 200+ stays clear of Zorro's own
@@ -1644,26 +1644,39 @@ DLLFUNC double BrokerCommand(int Mode, intptr_t Parameter)
         case SET_UUID:
             strcpy_s(G.Uuid, (char*)Parameter); return 1;
 
-        case 2020: { // SET_PROTSTOP (v0.23): exchange-side SL-M backstop
-            // Parameter (text) = "trigger,signedqty". signedqty > 0 = SELL
-            // SL-M protecting a long; < 0 = BUY SL-M protecting a short;
-            // qty 0 / empty text = cancel the symbol's backstop. Called by
-            // the strategy every bar with the tightest open-trade stop level
-            // over the full open quantity.
+        case 2020: { // SET_PROTSTOP (v0.24): exchange-side SL-M backstop
+            // Parameter (text) = "SYM,trigger,signedqty" (v0.24: symbol
+            // carried EXPLICITLY - Zorro batches BrokerAsset calls for all
+            // symbols each cycle, so the plugin's internal G.Symbol is stale
+            // (stuck on the last symbol) when publishes arrive; that caused
+            // the 2026-10-07 crossed-symbol incident where HDFCBANK's stop
+            // went out labeled TCS). signedqty > 0 = SELL SL-M protecting a
+            // long; < 0 = BUY SL-M protecting a short; qty 0 = cancel the
+            // symbol's backstop. Called by the strategy every bar.
             if (!isConnected()) return 0;
             const char* Given = Parameter ? (const char*)Parameter : "";
-            char LevelS[32] = "", QtyS[32] = "";
-            const char* Comma = Given[0] ? strchr(Given, ',') : 0;
-            if (Comma) {
-                size_t N1 = Comma - Given;
-                if (N1 > 0 && N1 < sizeof(LevelS)) {
-                    memcpy(LevelS, Given, N1); LevelS[N1] = 0;
-                    strcpy_s(QtyS, Comma + 1);
+            char SymS[32] = "", LevelS[32] = "", QtyS[32] = "";
+            const char* C1 = Given[0] ? strchr(Given, ',') : 0;
+            const char* C2 = C1 ? strchr(C1 + 1, ',') : 0;
+            if (C1 && C2) {
+                size_t N1 = C1 - Given, N2 = C2 - (C1 + 1);
+                if (N1 > 0 && N1 < sizeof(SymS)) {
+                    memcpy(SymS, Given, N1); SymS[N1] = 0;
+                    if (N2 > 0 && N2 < sizeof(LevelS)) {
+                        memcpy(LevelS, C1 + 1, N2); LevelS[N2] = 0;
+                        strcpy_s(QtyS, C2 + 1);
+                    }
                 }
+            }
+            if (!SymS[0] || !LevelS[0]) {
+                // malformed / legacy "trigger,qty" publish: ignore silently
+                // except in diag (v0.23 scripts were the old format)
+                if (G.Diag >= 1) showMsg("SL-M publish malformed (need SYM,trigger,qty):", Given);
+                return 1;
             }
             double Level = atof(LevelS);
             int SignedQty = atoi(QtyS);
-            int Row = symPosRow(G.Symbol);
+            int Row = symPosRow(SymS);
             // cancel-only publish (qty 0): flatten the backstop
             if (Level <= 0. || SignedQty == 0) {
                 if (Row >= 0 && G.SymPos[Row].ProtId[0]) return protCancel(Row);
@@ -1681,7 +1694,7 @@ DLLFUNC double BrokerCommand(int Mode, intptr_t Parameter)
                 int Toler = (G.SymPos[Row].Qty < 0) ? -G.SymPos[Row].Qty / 3 : G.SymPos[Row].Qty / 3;
                 if (Toler < 2) Toler = 2;
                 if (SignBad || Diff > Toler) {
-                    if (G.Diag >= 1) showMsg("SL-M skipped (map/live mismatch):", upperSymbol(G.Symbol));
+                    if (G.Diag >= 1) showMsg("SL-M skipped (map/live mismatch):", upperSymbol(SymS));
                     return 1;
                 }
             }
@@ -1692,7 +1705,7 @@ DLLFUNC double BrokerCommand(int Mode, intptr_t Parameter)
                 if (Same) return 1; // already in place, nothing to do
                 if (!protCancel(Row)) return 0; // fired: broker changed, resync first
             }
-            protPlace(G.Symbol, Level, SignedQty);
+            protPlace(SymS, Level, SignedQty);
             return 1;
         }
 

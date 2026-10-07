@@ -24,7 +24,7 @@ plugin by simply entering their OpenAlgo API key.
     pass option strike / expiry / call-or-put, since Indian option class symbols
     (e.g. `NIFTY22SEP2623250CE`) exceed Zorro's contract text slots
 - Daily-tested against a live OpenAlgo installation with real orders, option
-  trades, and position reconciliation. Recent hardening (v0.20–v0.23):
+  trades, and position reconciliation. Recent hardening (v0.20–v0.24):
   - `BrokerHistory2` guards against dead zero-range candles (exchange closing
     prints / auction freezes) that corrupt ATR
   - Position-state persistence: the position map is saved per symbol
@@ -33,7 +33,9 @@ plugin by simply entering their OpenAlgo API key.
     positionbook at login, so a Zorro relogin can no longer orphan open
     positions
   - Entry-vs-close classification by order direction relative to net position
-  - Optional exchange-side SL-M protective backstop orders
+  - Exchange-side SL-M protective backstop orders (`SET_PROTSTOP`, broker
+    command 2020): symbol-explicit publish format prevents crossed-symbol
+    stops when Zorro batches `BrokerAsset` calls
 
 > **Note:** `posstate_*.csv` files are generated at runtime and hold live
 > trading state. They are excluded from version control and are not part of
