@@ -1,0 +1,24 @@
+# Plugin runtime files (generated locally; not source)
+posstate_*.csv
+**/posstate_*.csv
+
+# Build outputs
+bin/
+bin64/
+Cache/
+Log/
+*.obj
+*.dll
+*.lib
+*.exe
+*.log
+*.tmp
+
+# Editor / IDE
+.vs/
+.vscode/
+*.user
+
+# OS artifacts
+Thumbs.db
+desktop.ini
