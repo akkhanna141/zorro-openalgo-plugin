@@ -21,7 +21,7 @@
 
 #define PLUGIN_TYPE     2
 #define PLUGIN_NAME     "OpenAlgo"
-#define PLUGIN_VERSION  "0.24"
+#define PLUGIN_VERSION  "0.30"
 
 // plugin-local SET_OPTCONTRACT command id (brokerCommand): homegrown
 // extension, not in Zorro's trading.h. 200+ stays clear of Zorro's own
@@ -81,10 +81,9 @@ struct GLOBAL {
     char OptStrike[16]; // strike price as text, f.i. "23250"
     char OptExpiry[16]; // YYYYMMDD
     char OptType[4];    // "CE" or "PE"
-    // Own-position map (plugin-side, per symbol): quantity we BELIEVE we hold,
-    // sign-aware (+ long /- short), accumulated from this plugin's own placed
-    // orders (signed Vol: entries add, closes subtract - exactly once each;
-    // the v0.17 double-subtract through symPosClose is gone in v0.18).
+    // Own-position map (plugin-side, per symbol): quantity the plugin holds,
+    // sign-aware (+ long /- short), accumulated from placed orders (signed
+    // Vol: entries add, closes subtract - exactly once each).
     // Used to clamp closes so Zorro can never sell more than it holds.
     struct {
         char Sym[32];
@@ -94,13 +93,30 @@ struct GLOBAL {
         double ProtLevel;  // published SL-M trigger price
         int    ProtQty;    // published signed qty (+SELL / -BUY)
     } SymPos[MAX_SYMPOS];
-    // Per-trade quantity heuristic (v0.18): Zorro calls BrokerSell2/
+    // Per-quote sanity gate (v0.26): one slot per symbol. A price outside
+    // the day's broker-truth band [low - 0.5%, high + 0.5%] is treated as a
+    // feed artifact; the last known-good price is served instead, so
+    // transient connectivity issues cannot distort indicators.
+    // The gate self-heals: after 3 consecutive out-of-band polls it
+    // re-anchors to accept genuine moves.
+    struct {
+        char Sym[32];
+        double LastGood;    // last accepted price served to Zorro (0 = none)
+        int    Rejects;     // consecutive out-of-band polls (self-heal)
+    } QuoteGate[MAX_SYMPOS];
+    // Per-trade quantity rule (v0.18): Zorro calls BrokerSell2/
     // BrokerTrade with its OWN ids (8-digit, observed 01-10), which this
     // plugin cannot map to its pseudo slots. But the split-exit design
     // always opens EQUAL halves, so per-trade qty = SymPos.Qty / SymPos.Cnt.
     // BrokerTrade reports that (kills `filled 20 of 10`), BrokerSell2 clamps
     // closes to it, and Cnt decrements per close. Equal halves make this
     // exact; the position map remains the hard safety net regardless.
+    // Exchanges subscribed this session (v0.28): BrokerTime is global (no
+    // asset argument), so the session's asset subscriptions decide which
+    // market clock applies - an NSE-only strategy gets NSE hours, an MCX
+    // strategy gets MCX hours. Wiped at login by memset(&G,0,...).
+    char ExchSet[8][16];
+    int  NExch;
 } G;
 
 // Utility functions /////////////////////////////////////////////////////////
@@ -166,14 +182,11 @@ ASSETCFG* findAsset(const char* Name)
 }
 
 // ------- position-state persistence (v0.22) ////////////////////////////
-// The plugin state (position map) lives in RAM and was wiped by every
-// BrokerLogin (memset at login). Zorro relogins happen on every session
-// start, every reconnect after an internet/plugin outage, and on SET_RESTART.
-// After a wipe, BrokerTrade reported every open trade as "closed" while the
-// broker still held the real position: unmanaged exposure, no stop, no exit
-// (the exact SBIN 2026-10-07 loss mechanism, re-triggered by any reconnect).
-// v0.22: persist SymPos after every order and restore + reconcile it
-// against the live broker positionbook at login.
+// The plugin state (position map) lives in RAM, and Zorro relogins occur
+// on every session start, reconnect, and SET_RESTART. State is therefore
+// persisted after every order and restored + reconciled against the live
+// broker positionbook at login, so open positions stay managed across
+// relogins.
 // v0.23: ONE FILE PER SYMBOL (Plugin\posstate_<keychk>_<sym>.csv), suffixed
 // with a checksum of the apikey - never the key itself. Two Zorro
 // instances on different accounts (or trading disjoint symbol sets on the
@@ -299,18 +312,12 @@ int posStateLoadAll(POSROW* Out, int MaxRows)
 // ------- own-position map (v0.18) ///////////////////////////////////////
 // The plugin tracks what IT placed per symbol: signed quantity (+ long /
 // - short) and the count of open trades. Entries add qty and count; closes
-// subtract BOTH (once - the v0.17 double-subtract is fixed). Attempts to
+// subtract BOTH (exactly once). Attempts to
 // close more than held are clamped/suppressed at submit time.
 
 // add an order: classify ENTRY vs CLOSE by the order direction RELATIVE to
-// the current net position, not by raw signed qty (v0.21 FIX - the SBIN
-// 2026-10-07 loss). v0.18 treated every SELL as a long-close and every BUY
-// as a long-entry: a short ENTRY (SELL while flat) left Cnt=0, so
-// BrokerTrade computed perTrade=0 -> "trade closed" -> Zorro phantom-closed
-// the trade one second after entry WITHOUT an order. The real broker short
-// (-104 SBIN) was left unmanaged with no stop and rode the trend up,
-// realized ~Rs1240 loss at the forced flip buyback.
-// v0.21 rules (symmetric for long and short):
+// the current net position, not by raw signed qty (v0.21), so short
+// entries are tracked correctly. Rules (symmetric for long and short):
 //   SELL when Owned <= 0  -> short ENTRY  (net more negative, Cnt++)
 //   SELL when Owned > 0   -> long CLOSE   (Cnt--)
 //   BUY  when Owned >= 0  -> long ENTRY   (net more positive, Cnt++)
@@ -654,20 +661,34 @@ int readT6History(const char* Symbol, const char* IntervalSuffix,
         // because off-hours the requested window straddles a non-trading gap;
         // returning the most recent N bars is the standard broker behavior.
         //
+        // v0.25: the End request from Zorro can be stale (Zorro re-stamps
+        // lookback bars by count from 'now'), so it is used only as a
+        // secondary filter, never as a hard truncation. The .t6 file,
+        // refreshed daily, is the freshest source of truth: serve the
+        // NEWEST NTicks bars from the file head. Bars newer than BOTH End
+        // and the file's newest bar would only exist if the request were
+        // from the future - never skip file-head bars for being "newer
+        // than End". Start is likewise not hard-enforced (straddles gaps).
+        //
         // TIME ZONE: .t6 files produced by ConvertIndia5min (v2026-09-09)
         // store ZORRO TIME (UTC): the conversion script subtracts IST 5h30m
         // from the broker's IST candles. Older IST-stamped files are NOT
-        // shifted again here (double-shifting corrupts the lookback); if a
+        // shifted again here (that would double-shift the lookback); if a
         // stale pre-09-09 .t6 is ever read, refresh it through
         // openalgo_refresh.py + ConvertIndia5min instead.
         const double IST_OFFSET = 0.0;
         int Received = 0;
+        // v0.25: newest-first file walk - take bars from the file HEAD
+        // (newest) until NTicks is filled. End is NOT enforced: a stale
+        // request End must not truncate the freshest data. (The REST branch
+        // above keeps its End clamp - broker-served candles are already
+        // windowed by the request's own start/end dates.)
         for (int k = 0; k < N && Received < NTicks; k++) {
             DATE t = Buf[k].time - IST_OFFSET;  // IST -> UTC
-            if (t > End) continue;      // skip bars newer than the requested End
-            // v0.20 FIX: skip dead bars (O==H==L==C, zero range) - same guard
-            // as the REST branch. Legacy .t6 files may still contain exchange
-            // closing prints / auction freezes that explode ATR.
+            // v0.20: skip dead bars (O==H==L==C, zero range) - same guard
+            // as the REST branch. Zero-range bars (exchange closing prints /
+            // auction freezes) carry no tradable information and distort
+            // range-based indicators such as ATR.
             if (Buf[k].fOpen == Buf[k].fHigh && Buf[k].fHigh == Buf[k].fLow
                 && Buf[k].fLow == Buf[k].fClose)
                 continue;
@@ -684,9 +705,8 @@ int readT6History(const char* Symbol, const char* IntervalSuffix,
         // order (oldest first, newest adjacent to 'now') and re-stamps the
         // lookback by count. We filled newest-first (the .t6 FILE convention -
         // a different code path), so Zorro's lookback bars were paired with the
-        // file's OLDEST records: the live chart showed a wrong-era price gap
-        // (Aug-2025 prices under 2026-09-28 stamps, verified bar-for-bar).
-        // Reverse in place: Ticks[0] = oldest, Ticks[Received-1] = newest.
+        // file's OLDEST records. Reverse in place: Ticks[0] = oldest,
+        // Ticks[Received-1] = newest.
         for (int a = 0, b = Received - 1; a < b; a++, b--) {
             T6 Tmp = Ticks[a]; Ticks[a] = Ticks[b]; Ticks[b] = Tmp;
         }
@@ -710,6 +730,63 @@ int readT6History(const char* Symbol, const char* IntervalSuffix,
 
 //////////////////////////////////////////////////////////////
 
+// ------- session clock (v0.28) ///////////////////////////////////////////
+// BrokerTime is global (no asset argument), so the session's subscribed
+// exchanges (recorded by BrokerAsset) decide which market clock applies.
+// per-exchange trading windows (seconds of UTC day; IST = UTC+5:30):
+//   NSE/BSE cash+derivates: 09:15:15-15:14:45 IST (v0.27 auction-trimmed
+//   window: pre-open + closing auctions excluded - see BrokerTime note)
+//   MCX:                    09:00:15-23:29:45 IST (non-agri session,
+//   edge-trimmed like NSE: 09:00:00 opening snap and 23:30 close skipped)
+static const int NSE_OPEN_S  = 3 * 3600 + 45 * 60 + 15;  // 03:45:15 UTC
+static const int NSE_CLOSE_S = 9 * 3600 + 44 * 60 + 45;  // 09:44:45 UTC
+static const int MCX_OPEN_S  = 3 * 3600 + 30 * 60 + 15;  // 03:30:15 UTC
+static const int MCX_CLOSE_S = 17 * 3600 + 59 * 60 + 45; // 17:59:45 UTC
+
+// record an exchange as subscribed this session (BrokerAsset calls this)
+static void sessionExchAdd(const char* Exch)
+{
+    if (!Exch || !*Exch) return;
+    // NSE/BSE/NSE_INDEX/BSE_INDEX/NFO/CDS all follow the NSE clock
+    if (0 == strcmp(Exch, "MCX")) {
+        for (int i = 0; i < G.NExch; i++)
+            if (0 == strcmp(G.ExchSet[i], "MCX")) return;
+        if (G.NExch < 8) strcpy_s(G.ExchSet[G.NExch++], "MCX");
+        return;
+    }
+    for (int i = 0; i < G.NExch; i++)
+        if (0 == strcmp(G.ExchSet[i], "NSE")) return;
+    if (G.NExch < 8) strcpy_s(G.ExchSet[G.NExch++], "NSE");
+}
+
+// 1 when any subscribed exchange follows the MCX clock
+static int sessionUsesMcx()
+{
+    for (int i = 0; i < G.NExch; i++)
+        if (0 == strcmp(G.ExchSet[i], "MCX")) return 1;
+    return 0;
+}
+
+// v0.29: market state of the subscribed exchanges' session clock.
+// 1 = at least one subscribed exchange is inside its trading window
+// (weekday + window open..close), 0 = all closed. Shared by BrokerTime and
+// the BrokerAsset session gate (single source of truth for both edges).
+static int sessionOpenNow()
+{
+    SYSTEMTIME st;
+    GetSystemTime(&st);
+    int utcSec = st.wHour * 3600 + st.wMinute * 60 + st.wSecond;
+    int OpenS, CloseS;
+    if (sessionUsesMcx()) { OpenS = MCX_OPEN_S; CloseS = MCX_CLOSE_S; }
+    else                  { OpenS = NSE_OPEN_S; CloseS = NSE_CLOSE_S; }
+    return (st.wDayOfWeek >= 1 && st.wDayOfWeek <= 5
+            && utcSec >= OpenS && utcSec < CloseS);
+}
+
+// most recent session close instant - superseded in v0.29 by the
+// quote-path gate in BrokerAsset, which is the effective mechanism
+// (see the BrokerTime and BrokerAsset notes). Function removed.
+
 DLLFUNC int BrokerOpen(char* Name, FARPROC fpMessage, FARPROC fpProgress)
 {
     strcpy_s(Name, 32, PLUGIN_NAME);
@@ -720,25 +797,33 @@ DLLFUNC int BrokerOpen(char* Name, FARPROC fpMessage, FARPROC fpProgress)
 
 DLLFUNC int BrokerTime(DATE* pTimeUTC)
 {
-    // OpenAlgo/NSE session: 09:15-15:30 IST = 03:45-10:00 UTC (IST = UTC+5:30).
-    // Returns Zorro's documented contract: 2 = open, 1 = closed-but-connected.
-    // Row 2 (UTC) is authoritative for the open/closed decision; it is
-    // derived from BROKER time (server quotes/ltp), not from the PC clock,
-    // so a wrong local timezone can never flip the trading state.
+    // v0.29 session clock (exchange-aware, per-exchange windows in
+    // sessionExchAdd above):
+    //   NSE/BSE: 09:15:15-15:14:45 IST = 03:45:15-09:44:45 UTC
+    //   MCX:     09:00:15-23:29:45 IST = 03:30:15-17:59:45 UTC
+    // (IST = UTC+5:30). The regulator's pre-open and closing-auction
+    // windows sit at the NSE session edges; bars built from auction
+    // prints misrepresent the traded range. The square-off runs at
+    // 15:05 IST, so bars after 15:15 carry no trading value.
+    //
+    // Design contract: this function keeps serving real advancing UTC
+    // time and reports open/closed state per the documented Zorro
+    // contract (2 = open, 1 = closed-but-connected; never 0 = re-login
+    // loop). Bar formation outside sessions is prevented by the
+    // quote-path gate in BrokerAsset (v0.29), which is the effective
+    // lever: Zorro completes a bar only when a price is served.
     SYSTEMTIME stUTC;
     GetSystemTime(&stUTC);                 // PC clock interpreted as UTC
-    int utcMin = stUTC.wHour * 60 + stUTC.wMinute;
-    int openM = 3 * 60 + 45;    // 03:45 UTC = 09:15 IST
-    int closeM = 10 * 60;       // 10:00 UTC = 15:30 IST
-    int dow = stUTC.wDayOfWeek; // 0=Sun ... 6=Sat
-    int MarketOpen = (dow >= 1 && dow <= 5 && utcMin >= openM && utcMin < closeM);
+    int MarketOpen = sessionOpenNow();     // single source of truth (v0.29)
 
-    // Serve the current UTC time to Zorro regardless of market state.
     if (pTimeUTC) {
+        // always serve the real advancing UTC time (per the documented
+        // contract; see the BrokerTime note above)
         FILETIME ft;
         GetSystemTimeAsFileTime(&ft);
-        FileTimeToSystemTime(&ft, &stUTC);
-        SystemTimeToVariantTime(&stUTC, pTimeUTC);
+        SYSTEMTIME stNow;
+        FileTimeToSystemTime(&ft, &stNow);
+        SystemTimeToVariantTime(&stNow, pTimeUTC);
     }
     return MarketOpen ? 2 : 1;
 }
@@ -895,6 +980,61 @@ DLLFUNC int BrokerAccount(char* Acct, double* pBalance, double* pTradeVal, doubl
     return 1;
 }
 
+// ------- per-quote sanity gate (v0.26) ///////////////////////////////////
+// Band gate on every price served to Zorro from the live quotes path.
+// The /quotes payload carries the broker's day-truth (open/high/low). A
+// price outside [low - tol, high + tol] is treated as a feed artifact
+// rather than a market move. tol = 0.5% covers legitimate gaps while
+// catching cross-wired or stale-session prices.
+static double quoteGatePrice(const char* Symbol, double DayOpen, double DayHigh,
+                             double DayLow, double Price)
+{
+    // locate/claim this symbol's slot
+    int Slot = -1, Free = -1;
+    for (int i = 0; i < MAX_SYMPOS; i++) {
+        if (G.QuoteGate[i].LastGood > 0. && 0 == strcmpi(G.QuoteGate[i].Sym, Symbol)) {
+            Slot = i; break;
+        }
+        if (Free < 0 && G.QuoteGate[i].LastGood == 0.) Free = i;
+    }
+    if (Slot < 0) {
+        if (Free < 0) return Price; // table full: fail open
+        Slot = Free;
+        strcpy_s(G.QuoteGate[Slot].Sym, Symbol);
+    }
+
+    // band check: broker day-truth only counts when plausible itself
+    const double tol = 0.005; // 0.5%
+    bool BandOK = (DayLow > 0. && DayHigh > 0. && DayLow <= DayHigh);
+    bool InBand = !BandOK
+        || (Price >= DayLow * (1. - tol) && Price <= DayHigh * (1. + tol));
+
+    if (InBand) {
+        G.QuoteGate[Slot].LastGood = Price;
+        G.QuoteGate[Slot].Rejects  = 0;
+        return Price;
+    }
+    // out of band: self-heal after 3 consecutive out-of-band polls (the
+    // broker's day-high/low may briefly lag a genuine fast move)...
+    G.QuoteGate[Slot].Rejects++;
+    if (G.QuoteGate[Slot].LastGood > 0. && G.QuoteGate[Slot].Rejects >= 3) {
+        // ...but a NEW session-seed (fresh slot, no history) or a persistent
+        // move re-anchors: accept and record
+        G.QuoteGate[Slot].LastGood = Price;
+        if (G.Diag >= 1) showMsg("quote gate re-anchored:", upperSymbol(Symbol));
+        return Price;
+    }
+    // hold the last known-good price for this poll
+    double Held = G.QuoteGate[Slot].LastGood;
+    if (G.Diag >= 1) {
+        char SB[160];
+        sprintf_s(SB, "%.2f -> held %.2f (band %.2f..%.2f)",
+            Price, Held, DayLow, DayHigh);
+        showMsg("quote gate reject:", SB);
+    }
+    return (Held > 0.) ? Held : Price; // no anchor yet: fail open
+}
+
 DLLFUNC int BrokerAsset(char* Symbol, double* pPrice, double* pSpread,
     double* pVolume, double* pPip, double* pPipCost, double* pMinAmount,
     double* pMargin, double* pRollLong, double* pRollShort)
@@ -906,6 +1046,26 @@ DLLFUNC int BrokerAsset(char* Symbol, double* pPrice, double* pSpread,
     }
     if (!isConnected() || !Symbol) return 0;
     strcpy_s(G.Symbol, Symbol);
+    sessionExchAdd(exchangeOf(Symbol)); // v0.28: session clock follows the
+                                        // subscribed exchanges (BrokerTime)
+    // v0.29 SESSION GATE: outside the subscribed exchanges' trading
+    // window, no price is served (return 0 = "market closed" to Zorro).
+    // Zorro completes a bar only when a price arrives, so rejecting the
+    // poll prevents bar formation outside the session window. Placement
+    // BEFORE the network call: no price traffic outside sessions at all.
+    // Only price polls (pPrice != NULL) are gated - the subscription
+    // call (pPrice == NULL) passes through so an evening Zorro start
+    // still subscribes all assets (Error 053 would otherwise disable
+    // them until the next restart). Opening auction snap (09:15:00) is
+    // excluded by the 15-second offset in sessionOpenNow().
+    if (pPrice && !sessionOpenNow()) {
+        if (G.Diag >= 1) {
+            char Db[96];
+            sprintf_s(Db, "%s - session closed, quote refused", upperSymbol(Symbol));
+            showMsg("session gate:", Db);
+        }
+        return 0; // Zorro reads this as market-closed: no bar, no trade
+    }
     char Inner[256];
     sprintf_s(Inner, "\"symbol\":\"%s\",\"exchange\":\"%s\"",
         apiSymbolOf(Symbol), exchangeOf(Symbol));
@@ -933,11 +1093,23 @@ DLLFUNC int BrokerAsset(char* Symbol, double* pPrice, double* pSpread,
     double Ask = strvar(Response, "ask", 0.);
     double Bid = strvar(Response, "bid", 0.);
     double Vol = strvar(Response, "volume", 0.);
+    double dOpen  = strvar(Response, "open",  0.);  // broker day-truth (v0.26)
+    double dHigh  = strvar(Response, "high",  0.);  // band for the quote gate
+    double dLow   = strvar(Response, "low",   0.);
     if (Ask <= 0.) Ask = Ltp;
     if (Bid <= 0.) Bid = Ltp;
     if (Ask <= 0. || Ltp == 0.) {
         failLog("quotes parse failed:", Response);
         return 0; // symbol unavailable -> Error 053
+    }
+    // v0.26: gate the price served to Zorro against the day's broker-truth
+    // band. A feed artifact (transient connectivity issue, stale session)
+    // is held at the last known-good price instead of building a distorted
+    // bar.
+    Ask = quoteGatePrice(Symbol, dOpen, dHigh, dLow, Ask);
+    if (Ask <= 0.) {
+        failLog("quotes gate rejected:", Response);
+        return 0;
     }
     if (pPrice)   *pPrice  = Ask;
     if (pSpread)  *pSpread = (Ask - Bid > 0.) ? (Ask - Bid) : 0.;
@@ -991,17 +1163,35 @@ DLLFUNC int BrokerHistory2(char* Symbol, DATE Start, DATE End, int TickMinutes, 
     sprintf_s(Inner, "\"symbol\":\"%s\",\"exchange\":\"%s\",\"interval\":\"%s\",\"start_date\":\"%s\",\"end_date\":\"%s\"",
         apiSymbolOf(Symbol), exchangeOf(Symbol), Interval, SDate, EDate);
 
+    // v0.30: LOCAL .t6 FIRST for the standard 5m interval, REST only fills
+    // the tail (today's prices). The .t6 files are refreshed daily and
+    // verified bar-for-bar against the API: they are the reference source.
+    // This ordering keeps the lookback anchored to verified data; REST
+    // candles are additionally filtered to stamps NEWER than the .t6 head,
+    // so mis-stamped REST responses cannot enter the series, and a REST
+    // serve whose newest candle is older than 3.5 days is discarded
+    // outright.
+    int Received = 0;
+    DATE T6Newest = 0.;
+    const int T6First = (5 == TickMinutes);
+    if (T6First) {
+        Received = readT6History(Symbol, Interval, Start, End, NTicks, Ticks);
+        if (Received > 0) T6Newest = Ticks[Received - 1].time; // chronological: last = newest
+    }
+
+    // REST pass: parse into a heap buffer, then guard and merge.
     char* Response = send("history", Inner);
 
     // OpenAlgo /history is only populated when the broker plugin exposes
     // historical data (verified: some brokers return an empty data array).
-    // Candles array most-recent-last; fill T6 in reverse (most-recent first).
-    int Received = 0;
-    if (Response && statusOK(Response)) {
+    int M = 0;              // accepted REST candles (chronological after reverse)
+    int DroppedOld = 0;     // candles rejected by the newer-than-.t6-head filter
+    T6* Temp = (T6*)malloc((size_t)NTicks * sizeof(T6));
+    if (Response && statusOK(Response) && Temp) {
         char* Pos = strchr(Response, '[');
         if (!Pos) Pos = Response;
-        while (Received < NTicks) {
-            char* Open = strrchr(Pos, '{'); // walk backwards
+        while (M < NTicks) {
+            char* Open = strrchr(Pos, '{'); // walk backwards (most-recent first)
             if (!Open) break;
             char* TStr = strtext(Open, "timestamp", "");
             if (!*TStr) { *Open = 0; continue; }
@@ -1010,11 +1200,12 @@ DLLFUNC int BrokerHistory2(char* Symbol, DATE Start, DATE End, int TickMinutes, 
             t += TickSpan; // bar close time per Zorro convention
             if (t < Start) break;
             if (t > End) { *Open = 0; continue; }
-            // v0.20 FIX: skip dead bars (O==H==L==C, zero range). Verified
-            // classes: exchange closing prints (huge vol, wrong price) and
-            // index/closing-auction freezes. A zero-range liquid 5m/1m bar
-            // carries no tradable information and explodes ATR (Supertrend
-            // dives for hours - verified live 2026-10-06).
+            // v0.30 wrong-era guard: keep only candles NEWER than the .t6 head
+            if (T6Newest > 0. && t <= T6Newest) { DroppedOld++; *Open = 0; continue; }
+            // v0.20: skip dead bars (O==H==L==C, zero range). Zero-range
+            // bars (exchange closing prints, index/closing-auction freezes)
+            // carry no tradable information and distort range-based
+            // indicators such as ATR.
             double dOpen  = strvar(Open, "open",   0.);
             double dHigh  = strvar(Open, "high",   0.);
             double dLow   = strvar(Open, "low",    0.);
@@ -1023,25 +1214,77 @@ DLLFUNC int BrokerHistory2(char* Symbol, DATE Start, DATE End, int TickMinutes, 
                 *Open = 0; // strip dead candle, do not fill
                 continue;
             }
-            Ticks[Received].time   = t;
-            Ticks[Received].fOpen  = dOpen;
-            Ticks[Received].fHigh  = dHigh;
-            Ticks[Received].fLow   = dLow;
-            Ticks[Received].fClose = dClose;
-            Ticks[Received].fVol   = strvar(Open, "volume", 0.);
-            Received++;
+            Temp[M].time   = t;
+            Temp[M].fOpen  = dOpen;
+            Temp[M].fHigh  = dHigh;
+            Temp[M].fLow   = dLow;
+            Temp[M].fClose = dClose;
+            Temp[M].fVol   = strvar(Open, "volume", 0.);
+            M++;
             *Open = 0; // strip processed candle
         }
-        // v0.19 FIX: reverse in place -> chronological order for Zorro's
+        // v0.19/v0.30: reverse in place -> chronological order for Zorro's
         // live-history loader (same bug as the .t6 fallback path above).
-        for (int a = 0, b = Received - 1; a < b; a++, b--) {
-            T6 Tmp = Ticks[a]; Ticks[a] = Ticks[b]; Ticks[b] = Tmp;
+        for (int a = 0, b = M - 1; a < b; a++, b--) {
+            T6 Tmp = Temp[a]; Temp[a] = Temp[b]; Temp[b] = Tmp;
         }
+        // v0.30 staleness guard: a REST serve whose newest candle is far in
+        // the past (e.g. year-old candles from a degraded API response) is
+        // discarded outright instead of being re-stamped by Zorro into the
+        // current window.
+        if (M > 0) {
+            double vNow = 0.;
+            SYSTEMTIME stN;
+            GetSystemTime(&stN);
+            if (SystemTimeToVariantTime(&stN, &vNow) && Temp[M - 1].time < vNow - 3.5) {
+                if (G.Diag >= 1)
+                    showMsg("REST history stale (newest >3.5d old) - discarded:", i64toa((__int64)M));
+                M = 0;
+            }
+        }
+        if (G.Diag >= 1 && M > 0) {
+            SYSTEMTIME sA, sB;
+            VariantTimeToSystemTime(Temp[0].time, &sA);
+            VariantTimeToSystemTime(Temp[M - 1].time, &sB);
+            char Diag[192];
+            sprintf_s(Diag, "REST tail bars: %d  %04d-%02d-%02d %02d:%02d .. %04d-%02d-%02d %02d:%02d (chronological)",
+                M, sA.wYear, sA.wMonth, sA.wDay, sA.wHour, sA.wMinute,
+                sB.wYear, sB.wMonth, sB.wDay, sB.wHour, sB.wMinute);
+            showMsg(Diag, "");
+        }
+        if (G.Diag >= 1 && M == 0 && T6Newest > 0. && DroppedOld > 0)
+            showMsg("REST candles all older than .t6 head - dropped (wrong-era guard):", i64toa((__int64)DroppedOld));
     }
 
-    // Fall back to the local frozen .t6 file when the broker serves no history.
-    // readT6History tries the requested interval suffix first, then "5m".
-    if (Received <= 0) {
+    // ---- merge: .t6 bars (older) first, REST bars (newer) appended; the
+    // newest NTicks bars overall are kept ----
+    if (M > 0) {
+        if (T6First && Received > 0) {
+            int Keep = NTicks - M;
+            if (Keep < 0) Keep = 0;
+            if (Keep > Received) Keep = Received;
+            if (Keep < Received) {
+                // drop the oldest .t6 bars, move the newest Keep to the front
+                for (int i = 0; i < Keep; i++) Ticks[i] = Ticks[Received - Keep + i];
+            }
+            Received = Keep;
+        } else {
+            // no .t6 source (or non-5m interval): REST is the sole series.
+            // Keep only the newest NTicks REST candles if the response was larger.
+            if (M > NTicks) {
+                for (int i = 0; i < NTicks; i++) Temp[i] = Temp[M - NTicks + i];
+                M = NTicks;
+            }
+            Received = 0;
+        }
+        for (int i = 0; i < M; i++) Ticks[Received++] = Temp[i];
+    }
+    if (Temp) free(Temp);
+
+    // Fall back to the local frozen .t6 file when no REST bars survived and
+    // the .t6 was not already the primary source. readT6History tries the
+    // requested interval suffix first, then "5m".
+    if (Received <= 0 && !T6First) {
         Received = readT6History(Symbol, Interval, Start, End, NTicks, Ticks);
         if (G.Diag >= 1)
             showMsg("t6 fallback bars:", i64toa((__int64)Received));
@@ -1052,9 +1295,8 @@ DLLFUNC int BrokerHistory2(char* Symbol, DATE Start, DATE End, int TickMinutes, 
 // returns NAY when no position; NAY-1 when closed; else the TRADE's remaining
 // quantity (per-slot registry; v0.16 - was symbol-level net, see plan note)
 // v0.16: reports the TRADE's own remaining quantity (from the per-slot
-// registry) instead of the symbol-level positionbook net. The old behavior
-// told every half-trade it held the whole symbol position ("filled 20 of 10"),
-// which made pooled flip exits request 2x the held quantity -> phantom shorts.
+// registry) instead of the symbol-level positionbook net, so each
+// half-trade reports only its own share.
 // v0.18: per-trade qty = mapped position / open-trade count (equal halves by
 // design; Zorro passes its OWN ids here which cannot be mapped to slots).
 DLLFUNC int BrokerTrade(int nTradeID, double* pOpen, double* pClose, double* pCost, double* pProfit)
@@ -1062,11 +1304,10 @@ DLLFUNC int BrokerTrade(int nTradeID, double* pOpen, double* pClose, double* pCo
     if (!isConnected() || !*G.Symbol) return 0;
     char* Response = send("positionbook", "", 2);
     if (!Response || !statusOK(Response)) {
-        // v0.22 FIX (outage behavior): a failed positionbook call is a NETWORK
-        // error, not a flat position. Returning NAY told Zorro "no position /
-        // trades gone" during a wifi/API outage while the broker still held
-        // real positions -> Zorro stops managing them (no stop, no exit).
-        // Instead: report the trade ALIVE with last-known map quantities.
+        // v0.22: a failed positionbook call is a NETWORK error, not a flat
+        // position. Returning NAY would tell Zorro "no position / trades
+        // gone" while the broker may still hold real positions. Instead:
+        // report the trade ALIVE with last-known map quantities.
         // pClose/pOpen stay untouched -> Zorro estimates from its own prices.
         int OwnQty2  = symPosGet(G.Symbol);
         int OpenCnt2 = 0;
@@ -1109,14 +1350,11 @@ DLLFUNC int BrokerTrade(int nTradeID, double* pOpen, double* pClose, double* pCo
         if (G.SymPos[i].Sym[0] && 0 == strcmpi(G.SymPos[i].Sym, G.Symbol)) {
             OpenCnt = G.SymPos[i].Cnt; break;
         }
-    // v0.21 FIX (the SBIN 2026-10-07 phantom-close): the map position sign
-    // must AGREE with the broker position sign. When the map disagrees with
-    // the broker (map +51 vs broker -2 after e.g. an untracked manual close
-    // or a state mismatch) the old code reported perTrade = abs(OwnQty/Cnt)
-    // as a LONG quantity, making Zorro manage a position that does not exist
-    // (or vice versa: ignore one that does). Sync the map to the broker:
-    // the broker positionbook is the ground truth for the NET position; the
-    // map only refines the per-trade split of that net.
+    // v0.21: the map position sign must AGREE with the broker position
+    // sign; otherwise Zorro would manage a position that does not exist
+    // (or miss one that does). The broker positionbook is the ground
+    // truth for the NET position; the map only refines the per-trade
+    // split of that net. On a sign mismatch, sync the map to the broker.
     if (SymFound && OpenCnt > 0 && OwnQty != 0) {
         int BQty = SymQty;  // signed broker net
         if ((OwnQty > 0 && BQty < 0) || (OwnQty < 0 && BQty > 0)) {
@@ -1153,13 +1391,12 @@ DLLFUNC int BrokerTrade(int nTradeID, double* pOpen, double* pClose, double* pCo
         showMsg("BrokerTrade:", Db);
     }
     // closed detection: nothing mapped (per-trade share exhausted) OR the
-    // broker reports the symbol flat. v0.22: the SymQty==0 -> NAY-1 return
-    // is GATED on the fill-lag window: a fresh entry takes ~10s to appear in
-    // the broker positionbook (verified: order 03:50:03, fill 03:50:13).
-    // During that window the broker shows flat; returning "trade closed"
-    // here made Zorro phantom-close fresh entries (the 2026-10-07 SBIN loss,
-    // second half). If an order was placed in the last 30s, report the
-    // trade ALIVE with last-known quantities instead.
+    // broker reports the symbol flat. The SymQty==0 -> NAY-1 return is
+    // GATED on the fill-lag window: a fresh entry takes ~10s to appear in
+    // the broker positionbook (order 03:50:03, fill 03:50:13). During
+    // that window the broker shows flat; reporting "trade closed" there
+    // would close a live trade prematurely. If an order was placed in the
+    // last 30s, report the trade ALIVE with last-known quantities instead.
     int BrokerFlat = (SymFound && SymQty == 0) || !SymFound;
     if (BrokerFlat && OpenCnt > 0) {
         int RecentOrder = (GetTickCount() - G.LastOrderTick) < 30000
@@ -1472,9 +1709,8 @@ static int placeOrder(char* Symbol, int Vol, double Limit, double* pPrice, int* 
     G.LastOrderTick = GetTickCount(); // fill-lag gate anchor (v0.21)
     // own-position map: track what THIS plugin placed (sign-aware); the
     // clamp layer in BrokerSell2 leans on this to prevent overselling.
-    // Closes are tracked too (signed Vol subtracts) - EXACTLY once; the
-    // caller (BrokerSell2) does NOT subtract again (v0.17 double-subtract
-    // fixed here in v0.18).
+    // Closes are tracked too (signed Vol subtracts) - exactly once; the
+    // caller (BrokerSell2) does NOT subtract again.
     symPosAdd(Symbol, Vol);
     posStateSave(); // v0.22: persist after every tracked order (survives relogin)
     if (G.Diag >= 1) {
@@ -1543,11 +1779,11 @@ DLLFUNC int BrokerSell2(int nTradeID, int nVol, double Limit, double* pClose, do
     // Reverse: closing a long => SELL, closing a short => BUY
     int Vol = -nVol;
     // v0.23: cancel the exchange-side SL-M backstop BEFORE closing through
-    // Zorro, so the two stop layers can never both fire (double exit ->
-    // phantom reverse position). If the backstop ALREADY fired (price gapped
-    // through the stop while we were not looking), the broker position is
-    // closed/reduced: SKIP the market close - it would create a phantom
-    // reverse at the broker - and let the map resync from the positionbook.
+    // Zorro, so the two stop layers can never both fire. If the backstop
+    // already fired (price gapped through the stop), the broker position
+    // is closed/reduced: skip the market close - it would create an
+    // unintended reverse position - and let the map resync from the
+    // positionbook.
     {
         int PRow = symPosRow(G.Symbol);
         if (PRow >= 0 && G.SymPos[PRow].ProtId[0]) {
@@ -1559,17 +1795,16 @@ DLLFUNC int BrokerSell2(int nTradeID, int nVol, double Limit, double* pClose, do
         }
     }
     // QUANTITY SAFETY NET (v0.18): Zorro passes ITS OWN trade id here (not
-    // our pseudo slots, observed live 01-10), so per-trade registries can't
-    // key on it. Protection is per-SYMBOL instead: clamp the close to this
-    // trade's per-trade share of the mapped position (equal halves by
-    // design); suppress entirely once nothing is left. Kills both the
-    // doubled exit and the redundant second close at the plugin.
+    // our pseudo slots), so per-trade registries can't key on it.
+    // Protection is per-SYMBOL instead: clamp the close to this trade's
+    // per-trade share of the mapped position (equal halves by design);
+    // suppress entirely once nothing is left. This prevents duplicated
+    // exits and redundant closes at the plugin.
     int Clamped = clampClose(G.Symbol, Vol);
     if (Clamped == 0) {
         // nothing of this symbol left to close: register the close as done
-        // instead of firing a phantom reverse order at the broker
-        // (01-10: these redundant closes were RMS-rejected by luck;
-        // 29-09 equivalents FILLED and created unmanaged phantom shorts)
+        // instead of submitting a redundant order to the broker, which
+        // would create unintended exposure
         showMsg("close suppressed (nothing left to close):", upperSymbol(G.Symbol));
         // v0.23: nothing left at our map - cancel any orphan SL-M backstop
         // (e.g. a manual close left it working at the exchange)
@@ -1647,12 +1882,11 @@ DLLFUNC double BrokerCommand(int Mode, intptr_t Parameter)
         case 2020: { // SET_PROTSTOP (v0.24): exchange-side SL-M backstop
             // Parameter (text) = "SYM,trigger,signedqty" (v0.24: symbol
             // carried EXPLICITLY - Zorro batches BrokerAsset calls for all
-            // symbols each cycle, so the plugin's internal G.Symbol is stale
-            // (stuck on the last symbol) when publishes arrive; that caused
-            // the 2026-10-07 crossed-symbol incident where HDFCBANK's stop
-            // went out labeled TCS). signedqty > 0 = SELL SL-M protecting a
-            // long; < 0 = BUY SL-M protecting a short; qty 0 = cancel the
-            // symbol's backstop. Called by the strategy every bar.
+            // symbols each cycle, so the plugin's internal G.Symbol may be
+            // stale when publishes arrive). signedqty > 0 = SELL SL-M
+            // protecting a long; < 0 = BUY SL-M protecting a short;
+            // qty 0 = cancel the symbol's backstop. Called by the strategy
+            // every bar.
             if (!isConnected()) return 0;
             const char* Given = Parameter ? (const char*)Parameter : "";
             char SymS[32] = "", LevelS[32] = "", QtyS[32] = "";
